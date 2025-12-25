@@ -127,9 +127,6 @@ export function App() {
 						),
 					},
 				}));
-
-				// Only turn off loading once we have at least one success
-				setIsLoading(false);
 			};
 
 			// 4. Handle Errors (Disconnect & Retry)
@@ -143,6 +140,8 @@ export function App() {
 		// Initial Connections
 		connect("master");
 		connect("tenant");
+
+		setIsLoading(false); // Regardless of connection success
 
 		// Cleanup on Component Unmount
 		return () => {
