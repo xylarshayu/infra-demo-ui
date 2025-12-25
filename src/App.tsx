@@ -1,5 +1,5 @@
 import { IconArrowBarRight, IconLoader2 } from "@tabler/icons-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Area, AreaChart, XAxis, YAxis } from "recharts";
 import { ModeToggle } from "@/components/mode-toggle";
 import { Badge } from "@/components/ui/badge";
@@ -12,16 +12,16 @@ import {
 } from "@/components/ui/chart";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { capitalizeFirstLetter, cn } from "@/lib/utils";
-import { isConnected as isMasterConnected } from "@/services/masterService";
-import { isConnected as isTenantConnected } from "@/services/tenantService";
+import { isConnectedSSE as isMasterConnectedSSE } from "@/services/masterService";
+import { isConnectedSSE as isTenantConnectedSSE } from "@/services/tenantService";
 import { SERVICE_TARGET_MAP, SERVICES } from "./constants/server.constants";
 import type { IConnected } from "./types/service";
 
 type StatusState = {
 	connected: boolean;
 	data: IConnected | null;
-	ping: number;
-	pingHistory: number[];
+	latency: number;
+	latencyHistory: number[];
 };
 
 type StatusesMap = Record<keyof typeof SERVICE_TARGET_MAP, StatusState>;
@@ -29,57 +29,130 @@ type StatusesMap = Record<keyof typeof SERVICE_TARGET_MAP, StatusState>;
 export function App() {
 	const [isLoading, setIsLoading] = useState(true);
 	const [statuses, setStatuses] = useState<StatusesMap>({
-		master: { connected: false, data: null, ping: Infinity, pingHistory: [] },
-		tenant: { connected: false, data: null, ping: Infinity, pingHistory: [] },
+		master: {
+			connected: false,
+			data: null,
+			latency: Infinity,
+			latencyHistory: [],
+		},
+		tenant: {
+			connected: false,
+			data: null,
+			latency: Infinity,
+			latencyHistory: [],
+		},
+	});
+	// Use Refs to track timeouts so we can clear them on unmount
+	const retryTimeouts = useRef<{
+		master: ReturnType<typeof setInterval> | null;
+		tenant: ReturnType<typeof setInterval> | null;
+	}>({
+		master: null,
+		tenant: null,
+	});
+	const heartbeatTimeouts = useRef<{
+		master: ReturnType<typeof setInterval> | null;
+		tenant: ReturnType<typeof setInterval> | null;
+	}>({
+		master: null,
+		tenant: null,
 	});
 
 	useEffect(() => {
-		const loadService = async (service: keyof typeof SERVICE_TARGET_MAP) => {
-			const start = performance.now();
-			let serviceData: StatusState = {
-				connected: false,
-				data: null,
-				ping: Infinity,
-				pingHistory: [],
-			};
-			try {
-				const serviceResponse = await (service === "master"
-					? isMasterConnected()
-					: isTenantConnected());
-				const end = performance.now();
-				const ping = Math.round(end - start);
-				const newPingHistory = [ping];
-				serviceData = {
-					connected: true,
-					data: serviceResponse.data,
-					ping,
-					pingHistory: newPingHistory,
-				};
-			} catch (error) {
-				const errorText =
-					error instanceof Error ? error.message : "Unknown error";
-				console.error(`Error loading ${service} service:`, errorText);
+		let masterSSE: EventSource | null = null;
+		let tenantSSE: EventSource | null = null;
+
+		// Generic function to handle connection logic
+		const connect = (service: "master" | "tenant") => {
+			// 1. Clear any pending retries for this service
+			if (retryTimeouts.current[service]) {
+				clearTimeout(retryTimeouts.current[service]);
+				retryTimeouts.current[service] = null;
 			}
 
-			setStatuses((prev) => ({
-				...prev,
-				[service]: {
-					...serviceData,
-					pingHistory: serviceData.connected
-						? [...(prev[service].pingHistory || []), serviceData.ping].slice(-5)
-						: prev[service].pingHistory,
-				},
-			}));
-		};
-		const fetchStatus = async () => {
-			await Promise.all([loadService("master"), loadService("tenant")]);
-			setIsLoading(false);
+			// 2. Instantiate the EventSource
+			const source =
+				service === "master" ? isMasterConnectedSSE() : isTenantConnectedSSE();
+
+			if (service === "master") masterSSE = source;
+			else tenantSSE = source;
+
+			const handleDisconnect = () => {
+				// if (source.readyState === EventSource.CLOSED) return;
+				console.error(`${service} connection lost (or heartbeat missed).`);
+				setStatuses((prev) => ({
+					...prev,
+					[service]: {
+						...prev[service],
+						connected: false,
+						latency: Infinity,
+					},
+				}));
+				source.close();
+				if (heartbeatTimeouts.current[service]) {
+					clearTimeout(heartbeatTimeouts.current[service]);
+				}
+				if (!retryTimeouts.current[service]) {
+					retryTimeouts.current[service] = setTimeout(() => {
+						connect(service);
+					}, 3000);
+				}
+			};
+
+			const resetHeartbeatCheck = () => {
+				if (heartbeatTimeouts.current[service]) {
+					clearTimeout(heartbeatTimeouts.current[service]);
+				}
+				heartbeatTimeouts.current[service] = setTimeout(() => {
+					console.warn(`${service} heartbeat timeout.`);
+					handleDisconnect();
+				}, 1000);
+			};
+
+			// 3. Handle Messages (Success)
+			source.onmessage = (event) => {
+				resetHeartbeatCheck();
+				const start = Date.now();
+				const { data } = JSON.parse(event.data) as { data: IConnected };
+				const latency = Math.max(0, start - data.health.now);
+
+				setStatuses((prev) => ({
+					...prev,
+					[service]: {
+						connected: true,
+						data,
+						latency,
+						latencyHistory: [...prev[service].latencyHistory, latency].slice(
+							-5,
+						),
+					},
+				}));
+
+				// Only turn off loading once we have at least one success
+				setIsLoading(false);
+			};
+
+			// 4. Handle Errors (Disconnect & Retry)
+			source.onerror = () => {
+				handleDisconnect();
+			};
+
+			resetHeartbeatCheck();
 		};
 
-		fetchStatus();
+		// Initial Connections
+		connect("master");
+		connect("tenant");
 
-		const interval = setInterval(fetchStatus, 1000);
-		return () => clearInterval(interval);
+		// Cleanup on Component Unmount
+		return () => {
+			if (masterSSE) masterSSE.close();
+			if (tenantSSE) tenantSSE.close();
+			if (retryTimeouts.current.master)
+				clearTimeout(retryTimeouts.current.master);
+			if (retryTimeouts.current.tenant)
+				clearTimeout(retryTimeouts.current.tenant);
+		};
 	}, []);
 
 	if (isLoading) {
@@ -111,7 +184,9 @@ export function App() {
 								service === "master"
 									? "bg-cyan-50 dark:bg-cyan-950"
 									: "bg-teal-50 dark:bg-teal-950";
-							const isOffline = serviceStatus.ping === Infinity;
+							const isOffline =
+								serviceStatus.latency === Infinity ||
+								serviceStatus.connected === false;
 							const serviceConnectedTo = SERVICE_TARGET_MAP[service];
 							const serviceConnectedTo_readable = capitalizeFirstLetter(
 								serviceConnectedTo.replace("Service", " Service"),
@@ -125,10 +200,10 @@ export function App() {
 								string,
 								{ label: string; color: string }
 							> = {
-								ping: { label: "Ping (ms)", color: chartColor },
+								latency: { label: "Latency (ms)", color: chartColor },
 							};
-							const chartData = serviceStatus.pingHistory.map(
-								(ping, index) => ({ index, ping }),
+							const chartData = serviceStatus.latencyHistory.map(
+								(latency, index) => ({ index, latency }),
 							);
 
 							return (
@@ -136,7 +211,9 @@ export function App() {
 									key={service}
 									className={cn(
 										"relative",
-										serviceStatus.connected ? bgColor : "bg-red-50",
+										serviceStatus.connected
+											? bgColor
+											: "bg-red-50 dark:bg-red-950",
 									)}
 								>
 									<CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -144,56 +221,60 @@ export function App() {
 											{capitalizeFirstLetter(service)} Service
 										</CardTitle>
 										<Badge
-											className="tracking-wider w-24"
+											className="tracking-wider w-28"
 											variant={isOffline ? "destructive" : "default"}
 										>
 											{isOffline
 												? "Offline"
-												: `PING ${String(serviceStatus.ping).padStart(3, " ")}ms`}
+												: `LATENCY ${String(serviceStatus.latency).padStart(3, " ")}ms`}
 										</Badge>
 									</CardHeader>
 									<CardContent>
-										{serviceStatus.pingHistory.length > 0 && (
-											<div className="h-16 mb-2">
-												<ChartContainer
-													config={chartConfig}
-													className="w-full h-full"
-												>
-													<AreaChart data={chartData}>
-														<Area
-															type="monotone"
-															dataKey="ping"
-															fill="var(--color-ping)"
-															stroke="var(--color-ping)"
-															fillOpacity={0.2}
-															strokeWidth={2}
-														/>
-														<XAxis hide />
-														<YAxis
-															hide
-															domain={["dataMin - 10", "dataMax + 10"]}
-														/>
-														<ChartTooltip content={<ChartTooltipContent />} />
-													</AreaChart>
-												</ChartContainer>
+										{serviceStatus.latencyHistory.length > 0 &&
+											serviceStatus.connected && (
+												<div className="h-16 mb-2">
+													<ChartContainer
+														config={chartConfig}
+														className="w-full h-full"
+													>
+														<AreaChart data={chartData}>
+															<Area
+																type="monotone"
+																dataKey="latency"
+																fill="var(--color-latency)"
+																stroke="var(--color-latency)"
+																fillOpacity={0.2}
+																strokeWidth={2}
+																animationDuration={500}
+															/>
+															<XAxis hide />
+															<YAxis
+																hide
+																domain={["dataMin - 10", "dataMax + 10"]}
+															/>
+															<ChartTooltip content={<ChartTooltipContent />} />
+														</AreaChart>
+													</ChartContainer>
+												</div>
+											)}
+										{serviceStatus.connected && (
+											<div className="flex flex-col gap-2">
+												<div className="flex items-center gap-2 text-sm font-medium">
+													<IconArrowBarRight size={18} className="opacity-80" />
+													<span className="text-xs tracking-wide">
+														{serviceConnectedTo_readable}
+													</span>
+													<div
+														className={cn(
+															"w-2 h-2 rounded-full",
+															isInternalServiceConnected
+																? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]"
+																: "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]",
+														)}
+													/>
+												</div>
 											</div>
 										)}
-										<div className="flex flex-col gap-2">
-											<div className="flex items-center gap-2 text-sm font-medium">
-												<IconArrowBarRight size={18} className="opacity-80" />
-												<span className="text-xs tracking-wide">
-													{serviceConnectedTo_readable}
-												</span>
-												<div
-													className={cn(
-														"w-2 h-2 rounded-full",
-														isInternalServiceConnected
-															? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)]"
-															: "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)]",
-													)}
-												/>
-											</div>
-										</div>
 									</CardContent>
 								</Card>
 							);

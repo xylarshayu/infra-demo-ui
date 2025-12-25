@@ -10,3 +10,7 @@ export const getHealthCheck = () => {
 export const isConnected = () => {
 	return tenantClient<IConnected>("/connected");
 };
+
+export const isConnectedSSE = () => {
+	return new EventSource("/tenant-ser/sse/connected");
+};

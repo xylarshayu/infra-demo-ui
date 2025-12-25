@@ -12,6 +12,10 @@ export const isConnected = () => {
 	return masterClient<IConnected>("/connected");
 };
 
+export const isConnectedSSE = () => {
+	return new EventSource("/master-ser/sse/connected");
+};
+
 export const getTenants = (queryOptions?: IQueryOptions) => {
 	return masterClient<ITenant[], "success-paginated">("/tenants", {
 		query: queryOptions,

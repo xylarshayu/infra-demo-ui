@@ -16,8 +16,10 @@ export type IServerHealth = {
 	status: "UP" | null;
 	uptime: number | null;
 	timestamp: string | null;
+	now: number;
 };
 
 export type IConnected = {
+	health: IServerHealth;
 	servicesConnected: Record<(typeof SERVICE_TARGETS)[number], IServerHealth>;
 };
